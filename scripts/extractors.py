@@ -3,7 +3,7 @@
 # info: {platform, external_id, url, title, publish_time, cover, play_url, nickname, uid, kind}
 # caption: 作者文案(视频) 或 图文正文；images: 图片 URL 列表（图文类）
 # 铁律：日志只打状态/摘要，不打印正文或文案。
-import os, re, json, time, requests, urllib.parse
+import os, re, json, time, requests, urllib.parse, urllib.request
 from common import log, http_get, ytdlp_json, resolve_url
 
 DOUYIN_SHARE_RE = re.compile(r'v\.douyin\.com|douyin\.com|douyin\.cn|iesdouyin\.com')
@@ -42,8 +42,13 @@ def _douyin_headers(ua):
 #
 # 关键结论（实测）：抖音对「数据中心 IP」一律风控——GitHub Azure 出口按区域被拦（westcentralus 空页，
 # eastus 偶通），Cloudflare Worker 出口同样被拦（返回无 _ROUTER_DATA 的风控页）。只有住宅/中国 IP 能解析。
-# 故优先走 DOUYIN_PROXY（住宅/中国代理）；未配代理时仍尝试直连（如本机/沙箱本身就是干净 IP 可成功），
-# 但 ingest.js 在「未配代理」时不会自动重试（数据中心 IP 直连必败，重试只是空耗 Actions 额度）。
+#
+# 破解办法（方案①）：把"被封的那一下网页抓取"交给**国内云函数**（腾讯云 SCF / 阿里云 FC，跑在中国节点→
+# 中国 IP，抖音不封），由云函数用干净 IP 抓分享页 HTML 回传，runner 本地复用既有解析逻辑（不重复解析代码）。
+# 云函数有免费额度、Serverless 免运维，不需要买服务器、也不需要买住宅代理订阅。
+# 优先级：国内云函数中继(DOUYIN_RELAY_URL) > 住宅代理(DOUYIN_PROXY) > 直连(本机/沙箱若本身是干净 IP 可成功)。
+RELAY_URL = os.environ.get('DOUYIN_RELAY_URL') or ''
+RELAY_TOKEN = os.environ.get('DOUYIN_RELAY_TOKEN') or ''
 PROXY = os.environ.get('DOUYIN_PROXY') or ''
 
 
@@ -51,7 +56,17 @@ def extract_douyin(url):
     url = resolve_url(url)
     if not DOUYIN_SHARE_RE.search(url):
         return None, '', []
-    # 走代理（若配置）：复用 Session 让重定向下发的 cookie 被分享页沿用；代理承担真实出口 IP
+    # 优先：国内云函数中继（腾讯云 SCF 等中国 IP，绕过抖音对数据中心 IP 的风控）
+    relay_data = _douyin_via_relay(url)
+    if relay_data:
+        info = _parse_douyin_data(relay_data, relay_data.get('aweme_id', ''), url)
+        if info:
+            caption = info['desc']
+            images = info.get('images', [])
+            log(f"douyin(中继) 解析成功 作者={info['nickname']} 文案长度={len(caption)}")
+            return info, caption, images
+        log("douyin(中继) 已取到 HTML 但解析为空，回退直连")
+    # 兜底：直连（干净 IP 本机可成功；数据中心 IP 会被抖音风控失败）/ 住宅代理
     s = requests.Session()
     s.headers.update({'Accept-Language': 'zh-CN,zh;q=0.9'})
     if PROXY:
@@ -81,6 +96,40 @@ def extract_douyin(url):
     images = info.get('images', [])
     log(f"douyin 解析成功 作者={info['nickname']} 文案长度={len(caption)}")
     return info, caption, images
+
+
+def _douyin_via_relay(url):
+    """经国内云函数（干净中国 IP）抓取抖音分享页 HTML，本地解析。返回 data dict 或 None。
+
+    云函数只负责"用中国 IP 抓网页"这一被封的环节，解析/转写/下载仍由 runner 完成，
+    避免在云函数里重复一套解析逻辑。云函数需配置 RELAY_TOKEN 鉴权，仅接受抖音域名，防止被滥用为开放代理。
+    """
+    if not RELAY_URL:
+        return None
+    try:
+        body = json.dumps({'url': url}).encode('utf-8')
+        req = urllib.request.Request(
+            RELAY_URL, data=body,
+            headers={'Authorization': ('Bearer ' + RELAY_TOKEN) if RELAY_TOKEN else '',
+                     'Content-Type': 'application/json', 'User-Agent': 'zsks-runner'},
+            method='POST')
+        with urllib.request.urlopen(req, timeout=60) as r:
+            resp = json.loads(r.read().decode('utf-8', 'ignore'))
+        if not resp.get('ok'):
+            log(f"douyin 中继失败: {resp.get('error')}")
+            return None
+        html = resp.get('html') or ''
+        if not html:
+            return None
+        data = _douyin_extract_json(html)
+        if data and _douyin_find_aweme(data):
+            data['aweme_id'] = resp.get('aweme_id') or ''
+            return data
+        log("douyin 中继返回 HTML 无 ROUTER_DATA")
+        return None
+    except Exception as e:
+        log(f"douyin 中继异常: {type(e).__name__} {str(e)[:120]}")
+        return None
 
 
 def _resolve_aweme_id(url, session):

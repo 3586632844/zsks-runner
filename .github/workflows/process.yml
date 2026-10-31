@@ -32,6 +32,8 @@ jobs:
       INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
       WORKER_URL: ${{ secrets.WORKER_URL }}
       DOUYIN_PROXY: ${{ secrets.DOUYIN_PROXY }}
+      DOUYIN_RELAY_URL: ${{ secrets.DOUYIN_RELAY_URL }}
+      DOUYIN_RELAY_TOKEN: ${{ secrets.DOUYIN_RELAY_TOKEN }}
       DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
       BILI_COOKIE: ${{ secrets.BILI_COOKIE }}
       XHS_COOKIE: ${{ secrets.XHS_COOKIE }}
